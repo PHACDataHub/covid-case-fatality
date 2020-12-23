@@ -1,0 +1,268 @@
+---
+title: "Covid Case Fatality"
+author: "Najmus Saqib"
+date: "23/12/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load libraries
+library(tidyverse)
+library(covid19nytimes)
+library(timetk)
+library(lubridate)
+library(broom)
+library(knitr)
+library(gt)
+library(janitor)
+library(zoo)
+library(scales)
+library(ggrepel)
+
+# Establish table style
+table_style <- list(cell_text(font = "Arial", size = "small"))
+
+```
+
+## Intro
+
+We will look into the relationship between cases and mortality, e.g. the lag between positive case and a death, how that varies by province, and how it has varied over time. 
+
+First of all, lets load the data. For now, work with the aggregated data from Canada.ca 
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+agg_df_raw <- read_csv("https://health-infobase.canada.ca/src/data/covidLive/covid19.csv") %>%
+        mutate(date = as.Date(date, format = "%d-%m-%Y"))
+
+agg_df <- agg_df_raw %>%
+        clean_names() %>%
+        filter(date >= "2020-03-08") %>%
+        select(prname, date, numtoday, numdeathstoday) %>%
+        group_by(prname) %>%
+        mutate(cases_sdma = rollmean(numtoday, 7, na.pad = TRUE, align = "right")) %>%
+        mutate(deaths_sdma = rollmean(numdeathstoday, 7, na.pad = TRUE, align = "right"))
+
+        
+```
+
+## Exploratory data analysis
+
+Let's look into the relationship between cases and deaths in Canada
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+agg_canada <- agg_df %>% filter(prname == "Canada") %>% ungroup() %>% select(-prname)
+
+ggplot(agg_canada, aes(cases_sdma, deaths_sdma)) +
+        geom_point() +
+        labs(
+                title = "Simple Scatterplot of Canada Cases vs. Deaths",
+                caption = "Source: HPOC via Health Infobase Covid-19 portal"
+  )
+```
+
+Now lets look at the breakdown by month
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+agg_month <- agg_df %>% filter(prname == "Canada") %>% mutate(month = month(date))
+
+ggplot(agg_month, aes(cases_sdma, deaths_sdma)) +
+        geom_point() +
+        facet_wrap(vars(month), scales = "free") +
+        labs(
+                title = "Simple Scatterplot of Canada Cases vs. Deaths",
+                caption = "Source: HPOC via Health Infobase Covid-19 portal"
+  )
+```
+
+Lets look at the breakdown by P/Ts
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+agg_prname <- agg_df %>% filter(!prname %in% c("Canada", "Repatriated travellers")) %>% mutate(month = month(date))
+
+ggplot(agg_prname, aes(cases_sdma, deaths_sdma)) +
+        geom_point() +
+        facet_wrap(vars(prname), scales = "fixed") +
+        labs(
+                title = "Simple Scatterplot of Canada Cases vs. Deaths",
+                caption = "Source: HPOC via Health Infobase Covid-19 portal"
+  )
+```
+Lets look at cases and deaths over time for Canada
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+coeff <- 30
+
+ggplot(agg_canada, aes(date, cases_sdma)) +
+  geom_line(color = "blue") +
+  theme(legend.position = "none") +
+  geom_line(aes(x = date, y = deaths_sdma * coeff), color = "red") +
+  scale_y_continuous(
+    labels = scales::comma,
+    name = "Cases",
+    sec.axis = sec_axis(deaths_sdma ~ . / coeff,
+      name = "Deaths",
+      labels = scales::comma
+    )
+  ) +
+  theme(
+    axis.title.y = element_text(color = "blue", size = 13),
+    axis.title.y.right = element_text(color = "red", size = 13),
+    panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black")
+  ) +
+  labs(
+    title = "Canada Cases vs. Deaths",
+    subtitle = "7-Day Average",
+    caption = "Source: HPOC via Health Infobase Covid-19 portal",
+    x = "Date"
+  )
+
+```
+
+## Modeling case versus deaths
+
+It looks like the more cases surge, the less the impact on deaths, which would be incorrect. A simple regression of deaths vs. cases and time shows the passage of time has more explanatory power than cases in predicting deaths so we have to take that into account.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+# passage of time affects deaths more than cases
+lm(deaths_sdma ~ cases_sdma + date, data = agg_canada) %>%
+        tidy() %>%
+        gt() %>% 
+        #tab_options(table.width = "60%") %>%
+        tab_style(style = table_style, 
+            locations = cells_body()) %>% 
+        opt_all_caps()
+```
+
+This is dealt with by running regression models of deaths and varying lags (actually leads) of cases. Lead deaths as opposed to lagging cases are chosen because it will allow us to make predictions about the future of deaths given cases today. We include the date as a variable as well. Once we’ve run regressions against each lead period, we’ll chose the lead period that has the best fit (R-Squared) to the data. A maxiumum of 30 days lead is explored.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+# create columns for deaths led 0 to 40 days ahead
+max_lead <- 30
+lags <- agg_canada %>%  
+        tk_augment_lags(deaths_sdma, .lags = 0:-max_lead, .names = "auto") # create lags by day
+
+# fix names to remove minus sign
+names(lags) <- names(lags) %>% str_replace_all("lag-|lag", "lead")
+
+# use only case dates where we have complete future knowledge of deaths for all lead times.
+lags <- lags %>% filter(date < max(date) - max_lead)
+
+lags[1:10, 1:7] %>%
+  gt() %>% 
+  tab_options(table.width = "100%") %>%
+  tab_style(style = table_style, 
+            locations = cells_body()) %>% 
+  opt_all_caps()
+```
+
+The following is the start of the model building process
+
+The result is a data frame with our lead times, the nested raw data, model and R-squared for each lead time.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+# make long form to nest
+# initialize models data frame
+models <- lags %>%
+  ungroup() %>%
+  pivot_longer(
+    cols = contains("lead"),
+    names_to = "lead",
+    values_to = "led_deaths"
+  ) %>%
+  select(date, cases_sdma, lead, led_deaths) %>%
+  mutate(lead = as.numeric(str_remove(lead, "deaths_sdma_lead"))) %>%
+  nest(data = c(date, cases_sdma, led_deaths)) %>%
+  # Run a regression on lagged cases and date vs deaths
+  mutate(model = map(
+    data,
+    function(df) {
+      lm(led_deaths ~ cases_sdma + poly(date, 1), data = df)
+    }
+  ))
+
+# Add regression coefficient
+# get adjusted r squared
+models <- models %>%
+  mutate(adj_r = map(model, function(x) {
+    glance(x) %>%
+      pull(adj.r.squared)
+  })
+  %>% unlist())
+
+print(models)
+```
+
+To decide the best-fit lead time we choose the model with the highest R-squared.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+# Show model fit by lead time
+# make predictions using best model
+best_fit <- models %>%
+  summarize(adj_r = max(adj_r)) %>%
+  left_join(models, by = "adj_r")
+
+ggplot(models, aes(lead, adj_r)) +
+  geom_line() +
+  labs(
+    subtitle = paste("Best fit lead =", best_fit$lead, "days"),
+    title = "Model Fit By Lag Days",
+    x = "Lead Time in Days for Deaths",
+    caption = "Source: HPOC via Health Infobase Covid-19 portal",
+    y = "Adjusted R-squared"
+  )
+
+```
+
+We can have some confidence that we are not overfitting the date variable because the significance of the case count remains. With a high enough degree polynomial on the date variable, cases would vanish in importance.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+best_fit$model[[1]] %>% 
+  tidy() %>% 
+  gt() %>% 
+  tab_options(table.width = "80%") %>%
+  tab_style(style = table_style, 
+            locations = cells_body()) %>% 
+  opt_all_caps()
+
+```
+
+## Making predictions
+
+The best-fit lead time is 19 days but let’s use predict to see how well our model fits to the actual deaths.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+# ------------------------------------------
+# see how well our model predicts
+# Function to create prediction plot
+show_predictions <- function(single_model, n.ahead) {
+  predicted_deaths <- predict(single_model$model[[1]], newdata = agg_canada)
+  date <- seq.Date(from = min(agg_canada$date) + best_fit$lead + 1, to = max(agg_canada$date) + best_fit$lead, by = 1) # had to add + 1 FSR :(
+  display <- full_join(agg_canada, tibble(date, predicted_deaths), by = "date")
+
+  gg <- display %>%
+    pivot_longer(cols = where(is.numeric)) %>%
+    filter(name %in% c("deaths_sdma", "predicted_deaths")) %>%
+    ggplot(aes(date, value, color = name)) +
+    geom_line() +
+          scale_x_date(
+                  "Date of case report",
+                  breaks = scales::breaks_width("4 weeks"),
+                  labels = label_date("%d%b")
+    )
+    labs(
+      title = "Actual vs. Predicted Deaths",
+      x = "Date",
+      y = "Deaths"
+    )
+  gg
+}
+
+show_predictions(best_fit, best_fit$lead)
+
+```
+
